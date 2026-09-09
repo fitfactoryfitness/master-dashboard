@@ -38,7 +38,10 @@ function buildTotalRevenue(businesses: BusinessRevenue[]): BusinessRevenue {
   };
 }
 
-const AUTO_REFRESH_INTERVAL_MS = 15000;
+// Revenue data doesn't change second to second — 30s keeps the Sheets API
+// read volume well under quota (each poll is 1 API call per business) with
+// plenty of margin, even with more than one viewer/tab open at once.
+const AUTO_REFRESH_INTERVAL_MS = 30000;
 
 async function fetchDashboard(month?: string): Promise<{ payload: DashboardPayload | null; error: string | null }> {
   const url = month ? `/api/dashboard?month=${month}` : "/api/dashboard";

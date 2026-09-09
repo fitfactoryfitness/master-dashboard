@@ -62,26 +62,14 @@ export async function listTabNames(spreadsheetId: string): Promise<string[]> {
     .filter((t): t is string => Boolean(t));
 }
 
-// Reads a specific set of A1 ranges in one round trip (used to pull just the
-// goal cell + the MTD revenue cell for a business, rather than the whole tab).
-export async function batchReadValues(
-  spreadsheetId: string,
-  ranges: string[]
-): Promise<(string | undefined)[]> {
-  const sheets = await getClient();
-  const res = await sheets.spreadsheets.values.batchGet({
-    spreadsheetId,
-    ranges,
-    valueRenderOption: "FORMATTED_VALUE",
-  });
-  return (res.data.valueRanges || []).map((vr) => vr.values?.[0]?.[0] as string | undefined);
-}
-
-// Same as batchReadValues, but for single-column vertical ranges (e.g.
-// "B44:B47") — returns every cell in the column, not just the first, so
-// callers can scan a small window of rows (e.g. to find a "TOTALS" label
-// whose exact row shifts with days-in-month).
-export async function batchReadColumnRanges(
+// Reads any set of A1 ranges in ONE network round trip — critical for quota:
+// Google's Sheets API "read requests per minute" quota counts one
+// batchGet call as a single request no matter how many ranges it carries,
+// so every caller in this app MUST fold all the ranges it needs for one
+// business into a single batchGetRanges call rather than making separate
+// calls per range. Each returned array holds every cell in that range in
+// row-major order (a single-cell range comes back as a 1-element array).
+export async function batchGetRanges(
   spreadsheetId: string,
   ranges: string[]
 ): Promise<(string | undefined)[][]> {

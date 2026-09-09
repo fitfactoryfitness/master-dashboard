@@ -55,7 +55,7 @@ export const BUSINESSES: BusinessConfig[] = [
     logoAlt: "Fit Factory Midtown",
     accent: "text-white",
     spreadsheetIdEnv: "GOOGLE_SHEETS_SPREADSHEET_ID_FITFACTORY",
-    goalCell: "R3",
+    goalCell: "Q3",
     revenueCell: "H83",
   },
   {

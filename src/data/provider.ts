@@ -1,5 +1,5 @@
 import { BUSINESSES, BusinessConfig } from "@/config/businesses";
-import { batchReadColumnRanges, batchReadValues, listTabNames } from "@/lib/googleSheets/client";
+import { batchGetRanges, listTabNames } from "@/lib/googleSheets/client";
 import { currentMonthTabName, MONTH_ABBR, monthFullName, resolveTab, titleCaseMonth, twoDigitYear } from "@/lib/googleSheets/tabResolver";
 import { parseCurrency } from "@/lib/spreadsheetParser/valueParsing";
 import { BusinessRevenue, DashboardPayload, SocialStats } from "@/types/dashboard";
@@ -34,6 +34,15 @@ const MOCK_REVENUE: Record<string, { revenueMTD: number; revenueGoal: number }> 
   "nrg-haus": { revenueMTD: 0, revenueGoal: 0 },
 };
 
+// Warm-instance cache of the last successfully read value per business per
+// month — Vercel functions reuse a warm instance across nearby requests, so
+// this absorbs most of a transient Sheets API failure (quota, network blip)
+// by serving the last good read instead of flashing "Not connected". It's
+// not guaranteed to survive a cold start, but that's an acceptable gap: a
+// cold start already means a fresh attempt at a real read.
+type CachedBusiness = { data: BusinessRevenue; cachedAt: number };
+const lastKnownGood = new Map<string, CachedBusiness>();
+
 // Builds this business's tab name for a given month/year using its own
 // naming convention (tabPrefix/tabCase/tabYearSuffix), the same formula
 // used for the live month — so picking a past month from the selector
@@ -44,33 +53,43 @@ function tabNameForMonth(business: BusinessConfig, monthAbbr: string, year: numb
   return `${business.tabPrefix ?? ""}${formattedMonth}${yearSuffix}`;
 }
 
-// The TOTALS row's exact row number shifts with days-in-month (28-31 days),
-// so business.revenueCell is only a reliable anchor for a 31-day month.
-// Scans the label column in a small window ending at the anchor row for a
-// cell reading "TOTALS", and reads the revenue value from whichever row
-// actually has it — self-correcting for any month length. Falls back to
-// the literal anchor cell (previous hardcoded behavior) if the label can't
-// be confirmed, with a warning only when that fallback is actually risky
-// (i.e. the month doesn't have 31 days, so the anchor row may be wrong).
-async function readRevenueForTab(
+// Reads the goal cell and the MTD revenue figure for one business/tab in a
+// SINGLE batchGet call. This matters for quota, not just speed: Google's
+// Sheets API "read requests per minute" quota counts one batchGet as one
+// request no matter how many ranges it carries, so every range this
+// business needs must be requested together — splitting it into separate
+// calls (as an earlier version of this function did) multiplies the quota
+// cost per business and is what caused live polling to start hitting
+// "Quota exceeded" errors.
+//
+// The revenue figure specifically comes from the sheet's own TOTALS row,
+// whose exact row number shifts with days-in-month (28-31 days) — so
+// business.revenueCell is only a reliable anchor for a 31-day month. This
+// scans the label column (default "B") in a small window ending at the
+// anchor row for a cell reading "TOTALS", and reads revenue from whichever
+// row actually has it — self-correcting for any month length. It only
+// falls back to the literal anchor cell (with a warning) if that label
+// can't be confirmed in a non-31-day month, where the anchor may be wrong.
+async function readBusinessCells(
   spreadsheetId: string,
   tab: string,
   business: BusinessConfig,
   monthAbbr: string,
   year: number
-): Promise<{ value: string | undefined; warning?: string }> {
+): Promise<{ goalRaw: string | undefined; revenueRaw: string | undefined; warning?: string }> {
   const { col: revCol, row: anchorRow } = parseCellRef(business.revenueCell!);
   const labelCol = business.revenueLabelColumn ?? "B";
   const windowStart = Math.max(1, anchorRow - 3);
 
-  const [labelCells, valueCells] = await batchReadColumnRanges(spreadsheetId, [
+  const [goalCells, labelCells, valueCells] = await batchGetRanges(spreadsheetId, [
+    `${tab}!${business.goalCell}`,
     `${tab}!${labelCol}${windowStart}:${labelCol}${anchorRow}`,
     `${tab}!${revCol}${windowStart}:${revCol}${anchorRow}`,
   ]);
 
   const offset = labelCells.findIndex((c) => (c ?? "").trim().toUpperCase() === "TOTALS");
   if (offset >= 0) {
-    return { value: valueCells[offset] };
+    return { goalRaw: goalCells[0], revenueRaw: valueCells[offset] };
   }
 
   const anchorOffset = anchorRow - windowStart;
@@ -79,7 +98,7 @@ async function readRevenueForTab(
     days !== 31
       ? `Could not confirm the TOTALS row for "${tab}" (expected near ${revCol}${anchorRow}) — showing that row directly, which may be off since this month has ${days} days.`
       : undefined;
-  return { value: valueCells[anchorOffset], warning };
+  return { goalRaw: goalCells[0], revenueRaw: valueCells[anchorOffset], warning };
 }
 
 async function fetchLiveBusinessRevenue(business: BusinessConfig, monthAbbr: string, year: number): Promise<BusinessRevenue> {
@@ -106,53 +125,57 @@ async function fetchLiveBusinessRevenue(business: BusinessConfig, monthAbbr: str
     };
   }
 
+  const cacheKey = `${business.id}:${monthAbbr}:${year}`;
   const defaultTab = tabNameForMonth(business, monthAbbr, year);
   const requestedTab = business.tabOverrideEnv && process.env[business.tabOverrideEnv]
     ? (process.env[business.tabOverrideEnv] as string)
     : defaultTab;
 
-  const attemptRead = async (tab: string) => {
-    const [[goalRaw], revenueResult] = await Promise.all([
-      batchReadValues(spreadsheetId, [`${tab}!${business.goalCell}`]),
-      readRevenueForTab(spreadsheetId, tab, business, monthAbbr, year),
-    ]);
-    return { goalRaw, revenueResult };
-  };
-
   try {
     let tab = requestedTab;
     let tabWarning: string | undefined;
-    let result;
+    let cells;
     try {
-      result = await attemptRead(tab);
+      cells = await readBusinessCells(spreadsheetId, tab, business, monthAbbr, year);
     } catch {
       // Requested tab likely doesn't exist yet — resolve against the real tab list.
       const availableTabs = await listTabNames(spreadsheetId);
       const resolution = resolveTab(requestedTab, availableTabs);
       tab = resolution.resolvedTab;
       tabWarning = resolution.warning;
-      result = await attemptRead(tab);
+      cells = await readBusinessCells(spreadsheetId, tab, business, monthAbbr, year);
     }
 
-    const goal = parseCurrency(result.goalRaw);
-    const revenue = parseCurrency(result.revenueResult.value);
+    const goal = parseCurrency(cells.goalRaw);
+    const revenue = parseCurrency(cells.revenueRaw);
 
-    return {
+    const result: BusinessRevenue = {
       ...base,
       connected: true,
       revenueMTD: revenue.value,
       revenueGoal: goal.value,
       resolvedTab: tab,
-      warning: tabWarning || result.revenueResult.warning || goal.warning || revenue.warning || null,
+      warning: tabWarning || cells.warning || goal.warning || revenue.warning || null,
     };
+    lastKnownGood.set(cacheKey, { data: result, cachedAt: Date.now() });
+    return result;
   } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to read spreadsheet.";
+    const cached = lastKnownGood.get(cacheKey);
+    if (cached) {
+      const ageMin = Math.round((Date.now() - cached.cachedAt) / 60000);
+      return {
+        ...cached.data,
+        warning: `Showing last known data (${ageMin < 1 ? "under a minute" : `${ageMin} min`} old) — refresh failed: ${message}`,
+      };
+    }
     return {
       ...base,
       connected: false,
       revenueMTD: null,
       revenueGoal: null,
       resolvedTab: null,
-      warning: err instanceof Error ? err.message : "Failed to read spreadsheet.",
+      warning: message,
     };
   }
 }

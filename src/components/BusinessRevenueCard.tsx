@@ -17,13 +17,14 @@ export function BusinessRevenueCard({
   socialStats?: SocialStats;
   socialStatsUpdatedAt?: string | null;
 }) {
+  const hasGoal = business.revenueGoal !== null;
   const pct =
     business.revenueMTD !== null && business.revenueGoal !== null && business.revenueGoal > 0
       ? (business.revenueMTD / business.revenueGoal) * 100
       : null;
-  const status = business.connected ? computePaceStatus(pct, calendarProgressPct) : "unavailable";
+  const status = business.connected && hasGoal ? computePaceStatus(pct, calendarProgressPct) : "unavailable";
   const colors = STATUS_COLORS[status] ?? STATUS_COLORS.unavailable;
-  const badgeText = business.connected ? badgeTextForPaceStatus(status, pct) : "Not connected";
+  const badgeText = !business.connected ? "Not connected" : !hasGoal ? "No goal set" : badgeTextForPaceStatus(status, pct);
 
   const CardTag = business.href ? "a" : "div";
   const linkProps = business.href ? { href: business.href, target: "_blank", rel: "noopener noreferrer" } : {};
@@ -59,13 +60,17 @@ export function BusinessRevenueCard({
       <span className="text-3xl md:text-5xl font-black text-white leading-none tracking-tight truncate">
         {business.connected ? fmtCurrency(business.revenueMTD) : "—"}
       </span>
-      {business.connected && (
+      {business.connected && hasGoal && (
         <span className="text-lg md:text-2xl text-slate-400 font-semibold shrink-0"> / {fmtCurrency(business.revenueGoal)}</span>
       )}
     </div>
   );
 
-  const progressBlock = business.connected ? (
+  const progressBlock = !business.connected ? (
+    <p className="text-sm text-slate-500">{business.warning || "Waiting on spreadsheet access."}</p>
+  ) : !hasGoal ? (
+    <p className="text-sm text-slate-500">No goal set for this month yet.{business.warning ? ` ${business.warning}` : ""}</p>
+  ) : (
     <div className="flex flex-col gap-1.5">
       <ProgressBar currentPct={pct} expectedPct={calendarProgressPct} status={status} height="h-3 md:h-4" />
       <div className="flex justify-between text-xs md:text-sm">
@@ -74,8 +79,6 @@ export function BusinessRevenueCard({
       </div>
       {business.warning && <p className="text-xs text-slate-500">{business.warning}</p>}
     </div>
-  ) : (
-    <p className="text-sm text-slate-500">{business.warning || "Waiting on spreadsheet access."}</p>
   );
 
   const statsBlock = socialStats && (
